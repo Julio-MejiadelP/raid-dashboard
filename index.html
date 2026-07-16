@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>RAID Management Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <style>
+        * { font-family: Arial, sans-serif !important; }
+        .color-midnight { background-color: #0E1020; color: white; }
+        .color-red { background-color: #D14600; color: white; }
+        .color-gold { background-color: #FFAE41; }
+        .color-canvas { background-color: #F6F3F0; }
+        .tab-btn { padding: 8px 16px; margin-right: 4px; border: none; cursor: pointer; background: #ddd; font-weight: bold; border-radius: 3px; }
+        .tab-btn.active { background: #0E1020; color: white; }
+        .filter-box { background: #f5f5f5; padding: 12px; border-radius: 4px; max-height: 120px; overflow-y: auto; border: 1px solid #ddd; }
+        .filter-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+    </style>
+</head>
+<body class="bg-canvas" style="font-family: Arial, sans-serif;">
+    <div id="app"></div>
+
+    <script>
+        let rawData = [];
+        let filteredData = [];
+        let selectedStatuses = [];
+        let chartInstances = {};
+        let currentTab = 'dashboard';
+        let selectedDetailFilters = {
+            types: [],
+            owners: [],
+            dates: [],
+            statuses: [],
+            projects: []
+        };
+
+        const categoryColors = { 'Risk': '#D14600', 'Issue': '#FF7E51', 'Decision': '#4995FF', 'Action': '#A1E6FF' };
+        const statusColors = { 'New': '#A1E6FF', 'Assigned': '#FFAE41', 'In Progress': '#4995FF', 'Monitor': '#FF7E51', 'Closed': '#90A4AE', 'Cancelled': '#BDBDBD' };
+
+        function parseDate(dateStr) {
+            if (!dateStr) return null;
+            try {
+                if (typeof dateStr === 'number') {
+                    const excelDate = new Date((dateStr - 25569) * 86400 * 1000);
+                    return excelDate;
+                }
+                const d = new Date(dateStr);
+                if (isNaN(d.getTime())) return null;
+                if (d.getFullYear() < 1970 || d.getFullYear() > 2100) return null;
+                return d;
+            } catch { return null; }
+        }
+
+        function formatDate(date) {
+            if (!date || isNaN(date.getTime())) return '';
+            return date.toISOString().split('T')[0];
+        }
+
+        function getColumnA(item) {
+            const keys = Object.keys(item);
+            const firstKey = keys[0];
+            return String(item[firstKey] || 'Unknown').trim();
+        }
+
+        function getAssignedTo(item) {
+            const names = ['Assigned to', 'Assigned To', 'Assigned', 'Assignee', 'assignedTo', 'assigned_to'];
+            for (let name of names) {
+                if (item[name]) return String(item[name] || '').trim();
+            }
+            return '';
+        }
+
+        function getOwningProject(item) {
+            return String(item['Owning Project'] || '').trim();
+        }
+
+        function handleUpload(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const bytes = new Uint8Array(evt.target.result);
+                    const wb = XLSX.read(bytes, {type: 'array'});
+                    const sheet = wb.SheetNames[0];
+                    rawData = XLSX.utils.sheet_to_json(wb.Sheets[sheet]);
+                    document.getElementById('fileName').textContent = `✅ ${file.name} | ${rawData.length} items`;
+                    filteredData = [...rawData];
+                    selectedStatuses = [];
+                    applyFilters();
+                } catch (err) {
+                    alert('Error: ' + err.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function applyFilters() {
+            const owning = Array.from(document.getElementById('filterOwningProject')?.selectedOptions || []).map(o => o.value);
+            filteredData = rawData.filter(item => {
+                let match = true;
+                if (owning.length > 0 && !owning.includes(getOwningProject(item))) match = false;
+                if (selectedStatuses.length > 0 && !selectedStatuses.includes(String(item['Status'] || ''))) match = false;
+                return match;
+            });
+            render();
+        }
+
+        function toggleStatus(status) {
+            const idx = selectedStatuses.indexOf(status);
+            if (idx > -1) selectedStatuses.splice(idx, 1);
+            else selectedStatuses.push(status);
+            applyFilters();
+        }
+
+        function getCategoryColor(category) { return categoryColors[String(category || '').trim()] || '#BDBDBD'; }
+        function getStatusColor(status) { return statusColors[String(status || '').trim()] || '#BDBDBD'; }
+
+        function switchTab(tab) {
+            currentTab = tab;
+            render();
+        }
+
+        // ===== DETAILED VIEW FILTERS =====
+        function toggleDetailFilter(filterType, value) {
+            const idx = selectedDetailFilters[filterType].indexOf(value);
+            if (idx > -1) {
+                selectedDetailFilters[filterType].splice(idx, 1);
+            } else {
+                selectedDetailFilters[filterType].push(value);
+            }
+            filterDetailedItems();
+        }
+
+        function clearAllFilters() {
+            document.getElementById('detailID').value = '';
+            selectedDetailFilters = { types: [], owners: [], dates: [], statuses: [], projects: [] };
+            
+            // Desmarcar todos los checkboxes
+            document.querySelectorAll('.detail-checkbox').forEach(cb => cb.checked = false);
+            
+            filterDetailedItems();
+        }
+
+        function filterDetailedItems() {
+            const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+            
+            const id = (document.getElementById('detailID')?.value || '').toLowerCase();
+            const types = selectedDetailFilters.types;
+            const owners = selectedDetailFilters.owners;
+            const dates = selectedDetailFilters.dates;
+            const statuses = selectedDetailFilters.statuses;
+            const projects = selectedDetailFilters.projects;
+
+            const filtered = active.filter(item => {
+                if (id && !String(item['ID'] || '').toLowerCase().includes(id)) return false;
+                if (types.length > 0 && !types.includes(getColumnA(item))) return false;
+                if (owners.length > 0 && !owners.includes(getAssignedTo(item))) return false;
+                if (dates.length > 0 && !dates.includes(formatDate(parseDate(item['Due Date'])))) return false;
+                if (statuses.length > 0 && !statuses.includes(String(item['Status'] || ''))) return false;
+                if (projects.length > 0 && !projects.includes(getOwningProject(item))) return false;
+                return true;
+            });
+
+            document.getElementById('detailedBody').innerHTML = filtered.map(item => {
+                const category = getColumnA(item);
+                const owner = getAssignedTo(item);
+                const dueDate = formatDate(parseDate(item['Due Date']));
+                const mitigation = String(item['Mitigation/Action Plan'] || item['Mitigation Plan'] || '');
+
+                return `
+                    <tr style="border-bottom: 1px solid #ddd;">
+                        <td style="padding: 8px; font-weight: bold; min-width: 50px;">${item['ID'] || ''}</td>
+                        <td style="padding: 8px; min-width: 80px;"><span style="background-color: ${getCategoryColor(category)}; color: white; padding: 3px 8px; border-radius: 3px; font-size: 10px; font-weight: bold;">${category}</span></td>
+                        <td style="padding: 8px; font-weight: bold; color: #0066cc; min-width: 200px;">${item['Title'] || ''}</td>
+                        <td style="padding: 8px; font-size: 11px; min-width: 250px;">${item['Description'] || ''}</td>
+                        <td style="padding: 8px; font-weight: bold; min-width: 100px;">${owner}</td>
+                        <td style="padding: 8px; min-width: 100px;">${dueDate}</td>
+                        <td style="padding: 8px; min-width: 100px;"><span style="background-color: ${getStatusColor(item['Status'])}; color: white; padding: 3px 6px; border-radius: 3px; font-size: 9px; font-weight: bold;">${item['Status'] || ''}</span></td>
+                        <td style="padding: 8px; font-size: 11px; min-width: 250px; white-space: pre-wrap;">${mitigation}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function exportToExcel() {
+            const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+            const id = (document.getElementById('detailID')?.value || '').toLowerCase();
+            const types = selectedDetailFilters.types;
+            const owners = selectedDetailFilters.owners;
+            const dates = selectedDetailFilters.dates;
+            const statuses = selectedDetailFilters.statuses;
+            const projects = selectedDetailFilters.projects;
+
+            const filtered = active.filter(item => {
+                if (id && !String(item['ID'] || '').toLowerCase().includes(id)) return false;
+                if (types.length > 0 && !types.includes(getColumnA(item))) return false;
+                if (owners.length > 0 && !owners.includes(getAssignedTo(item))) return false;
+                if (dates.length > 0 && !dates.includes(formatDate(parseDate(item['Due Date'])))) return false;
+                if (statuses.length > 0 && !statuses.includes(String(item['Status'] || ''))) return false;
+                if (projects.length > 0 && !projects.includes(getOwningProject(item))) return false;
+                return true;
+            });
+
+            const data = filtered.map(item => [
+                item['ID'] || '',
+                getColumnA(item),
+                item['Title'] || '',
+                item['Description'] || '',
+                getAssignedTo(item),
+                formatDate(parseDate(item['Due Date'])),
+                item['Status'] || '',
+                String(item['Mitigation/Action Plan'] || item['Mitigation Plan'] || '')
+            ]);
+
+            const ws = XLSX.utils.aoa_to_sheet([
+                ['#', 'Type', 'Item', 'Description', 'Owner', 'Due Date', 'Status', 'Mitigation/Action Plan'],
+                ...data
+            ]);
+
+            ws['!cols'] = [{wch: 8}, {wch: 12}, {wch: 25}, {wch: 35}, {wch: 15}, {wch: 12}, {wch: 12}, {wch: 40}];
+
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'RAID Items');
+            XLSX.writeFile(wb, `RAID_Report_${new Date().toISOString().slice(0, 10)}.xlsx`);
+        }
+
+        function exportToExcelProfesional() {
+            try {
+                const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+                const id = (document.getElementById('detailID')?.value || '').toLowerCase();
+                const types = selectedDetailFilters.types;
+                const owners = selectedDetailFilters.owners;
+                const dates = selectedDetailFilters.dates;
+                const statuses = selectedDetailFilters.statuses;
+                const projects = selectedDetailFilters.projects;
+
+                const filtered = active.filter(item => {
+                    if (id && !String(item['ID'] || '').toLowerCase().includes(id)) return false;
+                    if (types.length > 0 && !types.includes(getColumnA(item))) return false;
+                    if (owners.length > 0 && !owners.includes(getAssignedTo(item))) return false;
+                    if (dates.length > 0 && !dates.includes(formatDate(parseDate(item['Due Date'])))) return false;
+                    if (statuses.length > 0 && !statuses.includes(String(item['Status'] || ''))) return false;
+                    if (projects.length > 0 && !projects.includes(getOwningProject(item))) return false;
+                    return true;
+                });
+
+                const wb = XLSX.utils.book_new();
+
+                // ===== SHEET 1: EXECUTIVE COVER =====
+                const portadaData = [
+                    [''],
+                    [''],
+                    ['', '', '', 'ERP PROGRAM'],
+                    ['', '', '', 'RAID ITEMS REPORT'],
+                    [''],
+                    ['', '', '', `Generated: ${new Date().toLocaleDateString()}`],
+                    ['', '', '', `Total Items: ${filtered.length}`],
+                    [''],
+                    ['', '', '', 'Filters Applied:'],
+                    ...(types.length > 0 ? [['', '', '', `▪ Type: ${types.join(', ')}`]] : []),
+                    ...(owners.length > 0 ? [['', '', '', `▪ Owner: ${owners.join(', ')}`]] : []),
+                    ...(projects.length > 0 ? [['', '', '', `▪ Project: ${projects.join(', ')}`]] : []),
+                    ...(dates.length > 0 ? [['', '', '', `▪ Due Date: ${dates.join(', ')}`]] : []),
+                    ...(statuses.length > 0 ? [['', '', '', `▪ Status: ${statuses.join(', ')}`]] : [])
+                ];
+
+                const wsCover = XLSX.utils.aoa_to_sheet(portadaData);
+                wsCover['!cols'] = [{wch: 2}, {wch: 2}, {wch: 2}, {wch: 80}];
+                wsCover['!rows'] = [{hpx: 20}, {hpx: 20}, {hpx: 30}, {hpx: 28}, {hpx: 20}, {hpx: 18}, {hpx: 18}];
+
+                if (wsCover['D3']) {
+                    wsCover['D3'].font = { bold: true, size: 26, color: '#0E1020', name: 'Calibri' };
+                    wsCover['D3'].alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+                }
+                if (wsCover['D4']) {
+                    wsCover['D4'].font = { bold: true, size: 20, color: '#D14600', name: 'Calibri' };
+                    wsCover['D4'].alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+                }
+                if (wsCover['D6']) {
+                    wsCover['D6'].font = { size: 11, color: '#555555', name: 'Calibri' };
+                }
+                if (wsCover['D7']) {
+                    wsCover['D7'].font = { bold: true, size: 12, color: '#D14600', name: 'Calibri' };
+                }
+
+                for (let row = 8; row < portadaData.length; row++) {
+                    const cellRef = `D${row + 1}`;
+                    if (wsCover[cellRef]) {
+                        wsCover[cellRef].font = { size: 10, color: '#333333', name: 'Calibri' };
+                    }
+                }
+
+                XLSX.utils.book_append_sheet(wb, wsCover, 'Cover');
+
+                // ===== SHEET 2: ITEMS DETALLADOS =====
+                const itemsData = [
+                    ['ID', 'Type', 'Title', 'Project', 'Description', 'Owner', 'Status', 'Due Date', 'Mitigation/Action Plan']
+                ];
+
+                filtered.forEach(item => {
+                    const category = getColumnA(item);
+                    const owner = getAssignedTo(item);
+                    const dueDate = formatDate(parseDate(item['Due Date']));
+                    const project = getOwningProject(item);
+                    const status = item['Status'] || '';
+                    const mitigation = String(item['Mitigation/Action Plan'] || item['Mitigation Plan'] || '');
+
+                    itemsData.push([
+                        item['ID'] || '',
+                        category,
+                        item['Title'] || '',
+                        project,
+                        item['Description'] || '',
+                        owner,
+                        status,
+                        dueDate,
+                        mitigation
+                    ]);
+                });
+
+                const wsItems = XLSX.utils.aoa_to_sheet(itemsData);
+                wsItems['!cols'] = [
+                    {wch: 7},
+                    {wch: 13},
+                    {wch: 30},
+                    {wch: 22},
+                    {wch: 35},
+                    {wch: 18},
+                    {wch: 14},
+                    {wch: 12},
+                    {wch: 40}
+                ];
+
+                wsItems['!rows'] = [{hpx: 25}];
+                for (let i = 1; i < itemsData.length; i++) {
+                    if (!wsItems['!rows']) wsItems['!rows'] = [];
+                    wsItems['!rows'][i] = {hpx: 40};
+                }
+
+                // HEADER - Premium Design
+                for (let col = 0; col < 9; col++) {
+                    const cellRef = XLSX.utils.encode_col(col) + '1';
+                    if (!wsItems[cellRef]) wsItems[cellRef] = {};
+                    
+                    wsItems[cellRef].font = { bold: true, size: 11, color: '#FFFFFF', name: 'Calibri' };
+                    wsItems[cellRef].fill = { fgColor: { rgb: '#0E1020' } };
+                    wsItems[cellRef].alignment = { 
+                        horizontal: 'center', 
+                        vertical: 'center', 
+                        wrapText: true 
+                    };
+                    wsItems[cellRef].border = {
+                        top: {style: 'thick', color: '#0E1020'},
+                        bottom: {style: 'thick', color: '#0E1020'},
+                        left: {style: 'thin', color: '#0E1020'},
+                        right: {style: 'thin', color: '#0E1020'}
+                    };
+                }
+
+                // DATOS - Con diseño premium
+                for (let row = 1; row < itemsData.length; row++) {
+                    const typeValue = itemsData[row][1];
+                    const statusValue = itemsData[row][6];
+                    const typeColor = getCategoryColor(typeValue);
+                    const statusColor = getStatusColor(statusValue);
+                    const bgColor = row % 2 === 0 ? '#FFFFFF' : '#F5F5F5';
+
+                    for (let col = 0; col < 9; col++) {
+                        const cellRef = XLSX.utils.encode_col(col) + (row + 1);
+                        if (!wsItems[cellRef]) wsItems[cellRef] = {};
+
+                        wsItems[cellRef].alignment = { 
+                            vertical: 'top', 
+                            wrapText: true,
+                            horizontal: col === 0 || col === 1 || col === 6 ? 'center' : 'left'
+                        };
+                        wsItems[cellRef].border = {
+                            top: {style: 'thin', color: '#E8E8E8'},
+                            bottom: {style: 'thin', color: '#E8E8E8'},
+                            left: {style: 'thin', color: '#E8E8E8'},
+                            right: {style: 'thin', color: '#E8E8E8'}
+                        };
+
+                        // Columna TYPE - Badges coloridas
+                        if (col === 1) {
+                            wsItems[cellRef].fill = { fgColor: { rgb: typeColor } };
+                            wsItems[cellRef].font = { bold: true, size: 10, color: '#FFFFFF', name: 'Calibri' };
+                            wsItems[cellRef].alignment = { 
+                                horizontal: 'center', 
+                                vertical: 'center',
+                                wrapText: true 
+                            };
+                        }
+                        // Columna STATUS - Badges coloridas
+                        else if (col === 6) {
+                            wsItems[cellRef].fill = { fgColor: { rgb: statusColor } };
+                            wsItems[cellRef].font = { bold: true, size: 10, color: '#FFFFFF', name: 'Calibri' };
+                            wsItems[cellRef].alignment = { 
+                                horizontal: 'center', 
+                                vertical: 'center',
+                                wrapText: true 
+                            };
+                        }
+                        // Resto - Fondo alternado con borde sutil
+                        else {
+                            wsItems[cellRef].fill = { fgColor: { rgb: bgColor } };
+                            wsItems[cellRef].font = { size: 10, color: '#333333', name: 'Calibri' };
+                        }
+                    }
+                }
+
+                XLSX.utils.book_append_sheet(wb, wsItems, 'Items');
+
+                // ===== SHEET 3: EXECUTIVE SUMMARY =====
+                const typeStats = Object.fromEntries(
+                    filtered.reduce((acc, item) => {
+                        const type = getColumnA(item);
+                        acc.set(type, (acc.get(type) || 0) + 1);
+                        return acc;
+                    }, new Map())
+                );
+
+                const statusStats = Object.fromEntries(
+                    filtered.reduce((acc, item) => {
+                        const status = item['Status'] || '';
+                        acc.set(status, (acc.get(status) || 0) + 1);
+                        return acc;
+                    }, new Map())
+                );
+
+                const resumenData = [
+                    ['RAID SUMMARY REPORT'],
+                    [''],
+                    ['Key Metrics'],
+                    ['Total Filtered Items', filtered.length],
+                    ['Total Active Items', active.length],
+                    [''],
+                    ['Distribution by Type', 'Count', 'Percentage'],
+                    ...Object.entries(typeStats).sort().map(([type, count]) => [
+                        type, 
+                        count, 
+                        (((count / filtered.length) * 100).toFixed(1) + '%')
+                    ]),
+                    [''],
+                    ['Distribution by Status', 'Count', 'Percentage'],
+                    ...Object.entries(statusStats).sort().map(([status, count]) => [
+                        status, 
+                        count, 
+                        (((count / filtered.length) * 100).toFixed(1) + '%')
+                    ])
+                ];
+
+                const wsSummary = XLSX.utils.aoa_to_sheet(resumenData);
+                wsSummary['!cols'] = [{wch: 28}, {wch: 14}, {wch: 14}];
+
+                // Estilos Summary - Premium
+                wsSummary['A1'].font = { bold: true, size: 16, color: '#FFFFFF', name: 'Calibri' };
+                wsSummary['A1'].fill = { fgColor: { rgb: '#0E1020' } };
+                wsSummary['A1'].alignment = { horizontal: 'left', vertical: 'center' };
+                wsSummary['A1'].border = {
+                    top: {style: 'thick', color: '#0E1020'},
+                    bottom: {style: 'thick', color: '#0E1020'}
+                };
+                
+                for (let row = 0; row < resumenData.length; row++) {
+                    const cellA = 'A' + (row + 1);
+                    const cellB = 'B' + (row + 1);
+                    const cellC = 'C' + (row + 1);
+                    
+                    if (resumenData[row][0] === 'Key Metrics' || resumenData[row][0] === 'Distribution by Type' || resumenData[row][0] === 'Distribution by Status') {
+                        [cellA, cellB, cellC].forEach(cell => {
+                            if (!wsSummary[cell]) wsSummary[cell] = {};
+                            wsSummary[cell].font = { bold: true, size: 11, color: '#FFFFFF', name: 'Calibri' };
+                            wsSummary[cell].fill = { fgColor: { rgb: '#0E1020' } };
+                            wsSummary[cell].border = {
+                                top: {style: 'medium', color: '#0E1020'},
+                                bottom: {style: 'medium', color: '#0E1020'}
+                            };
+                        });
+                    } else if (resumenData[row][0] && resumenData[row][0] !== '' && 
+                               (resumenData[row][0] === 'Total Filtered Items' || resumenData[row][0] === 'Total Active Items' || 
+                                Object.keys(typeStats).includes(resumenData[row][0]) || 
+                                Object.keys(statusStats).includes(resumenData[row][0]))) {
+                        if (!wsSummary[cellA]) wsSummary[cellA] = {};
+                        wsSummary[cellA].fill = { fgColor: { rgb: '#F0F0F0' } };
+                        wsSummary[cellA].font = { size: 10, color: '#333333', name: 'Calibri' };
+                        
+                        if (!wsSummary[cellB]) wsSummary[cellB] = {};
+                        wsSummary[cellB].fill = { fgColor: { rgb: '#F0F0F0' } };
+                        wsSummary[cellB].font = { size: 10, bold: true, color: '#0E1020', name: 'Calibri' };
+                        wsSummary[cellB].alignment = { horizontal: 'center' };
+                        
+                        if (!wsSummary[cellC]) wsSummary[cellC] = {};
+                        wsSummary[cellC].fill = { fgColor: { rgb: '#F0F0F0' } };
+                        wsSummary[cellC].font = { size: 10, color: '#666666', name: 'Calibri' };
+                        wsSummary[cellC].alignment = { horizontal: 'center' };
+                    }
+                }
+
+                XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary');
+
+                // Guardar
+                XLSX.writeFile(wb, `RAID_Report_${new Date().toISOString().slice(0, 10)}.xlsx`);
+                alert(`✅ ¡Excel Premium Ejecutivo exportado!\n\n${filtered.length} items con diseño profesional DXC\n\n3 Hojas Premium:\n✓ Executive Cover\n✓ Detailed Items (Badges + Colores)\n✓ Analytics Summary`);
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error al exportar: ' + error.message);
+            }
+        }
+
+        function renderDetailedView() {
+            if (rawData.length === 0) {
+                return `<div class="bg-white p-16 text-center rounded"><p class="text-gray-600 text-2xl">📁 Load an Excel file</p></div>`;
+            }
+
+            const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+            const types = [...new Set(active.map(r => getColumnA(r)).filter(Boolean))].sort();
+            const owners = [...new Set(active.map(r => getAssignedTo(r)).filter(Boolean))].sort();
+            const dates = [...new Set(active.map(r => {
+                const d = parseDate(r['Due Date']);
+                return d ? formatDate(d) : '';
+            }).filter(Boolean))].sort();
+            const statuses = [...new Set(active.map(r => String(r['Status'] || '').trim()).filter(Boolean))].sort();
+            const projects = [...new Set(active.map(r => getOwningProject(r)).filter(Boolean))].sort();
+
+            return `
+                <div style="padding: 20px;">
+                    <h2 style="font-size: 24px; font-weight: bold; margin-bottom: 5px;">ERP PROGRAM - RAID ITEMS</h2>
+                    <p style="font-size: 12px; color: #666; margin-bottom: 20px;">As of ${new Date().toLocaleDateString()}</p>
+
+                    <div style="background: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                            <p style="font-weight: bold; margin: 0;">🔍 Filters (Multi-Select - CHECK to select):</p>
+                            <button onclick="clearAllFilters()" style="background: #4995FF; color: white; padding: 6px 14px; border: none; border-radius: 3px; font-weight: bold; cursor: pointer; font-size: 12px;">🗑 Clear All Filters</button>
+                        </div>
+
+                        <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;">
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">ID (Search)</label>
+                                <input type="text" id="detailID" onkeyup="filterDetailedItems()" placeholder="Search ID..." style="width: 100%; padding: 6px; border: 1px solid #ccc; border-radius: 3px; font-size: 11px;" />
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">Type</label>
+                                <div class="filter-box">
+                                    ${types.map(t => `
+                                        <div class="filter-item">
+                                            <input type="checkbox" class="detail-checkbox" id="type_${t}" ${selectedDetailFilters.types.includes(t) ? 'checked' : ''} onchange="toggleDetailFilter('types', '${t}')" />
+                                            <label for="type_${t}" style="cursor: pointer; font-size: 11px;">${t}</label>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">Owner</label>
+                                <div class="filter-box">
+                                    ${owners.map(o => `
+                                        <div class="filter-item">
+                                            <input type="checkbox" class="detail-checkbox" id="owner_${o}" ${selectedDetailFilters.owners.includes(o) ? 'checked' : ''} onchange="toggleDetailFilter('owners', '${o}')" />
+                                            <label for="owner_${o}" style="cursor: pointer; font-size: 11px;">${o}</label>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">Project</label>
+                                <div class="filter-box">
+                                    ${projects.map(p => `
+                                        <div class="filter-item">
+                                            <input type="checkbox" class="detail-checkbox" id="project_${p}" ${selectedDetailFilters.projects.includes(p) ? 'checked' : ''} onchange="toggleDetailFilter('projects', '${p}')" />
+                                            <label for="project_${p}" style="cursor: pointer; font-size: 11px;">${p}</label>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">Due Date</label>
+                                <div class="filter-box">
+                                    ${dates.map(d => `
+                                        <div class="filter-item">
+                                            <input type="checkbox" class="detail-checkbox" id="date_${d}" ${selectedDetailFilters.dates.includes(d) ? 'checked' : ''} onchange="toggleDetailFilter('dates', '${d}')" />
+                                            <label for="date_${d}" style="cursor: pointer; font-size: 11px;">${d}</label>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; font-weight: bold; display: block; margin-bottom: 8px;">Status</label>
+                                <div class="filter-box">
+                                    ${statuses.map(s => `
+                                        <div class="filter-item">
+                                            <input type="checkbox" class="detail-checkbox" id="status_${s}" ${selectedDetailFilters.statuses.includes(s) ? 'checked' : ''} onchange="toggleDetailFilter('statuses', '${s}')" />
+                                            <label for="status_${s}" style="cursor: pointer; font-size: 11px;">${s}</label>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                        <button onclick="exportToExcelProfesional()" style="background: #D14600; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; font-size: 12px;">📊 Export to Excel Profesional</button>
+                    </div>
+
+                    <div style="overflow-x: auto; border: 1px solid #ddd; border-radius: 5px;">
+                        <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+                            <thead>
+                                <tr style="background: #0E1020; color: white; position: sticky; top: 0;">
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">#</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Type</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Item</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Description</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Owner</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Due Date</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Status</th>
+                                    <th style="padding: 10px; text-align: left; font-weight: bold;">Mitigation/Action Plan</th>
+                                </tr>
+                            </thead>
+                            <tbody id="detailedBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // ===== DASHBOARD VIEW =====
+        function renderDashboardView() {
+            if (rawData.length === 0) {
+                return `<div class="bg-white p-16 text-center rounded"><p class="text-gray-600 text-2xl">📁 Upload Excel File</p></div>`;
+            }
+
+            const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+            const closed = filteredData.filter(d => String(d['Status'] || '').trim() === 'Closed').length;
+            const cancelled = filteredData.filter(d => String(d['Status'] || '').trim() === 'Cancelled').length;
+
+            return `
+                <div class="space-y-4">
+                    <div class="grid grid-cols-5 gap-2 mb-4">
+                        <div class="color-red p-3 rounded text-white text-center">
+                            <p class="text-xs font-bold">ACTIVE</p>
+                            <p class="text-2xl font-bold">${active.length}</p>
+                        </div>
+                        <div class="color-gold p-3 rounded text-black text-center">
+                            <p class="text-xs font-bold">CLOSED</p>
+                            <p class="text-2xl font-bold">${closed}</p>
+                        </div>
+                        <div class="bg-gray-400 text-white p-3 rounded text-center">
+                            <p class="text-xs font-bold">CANCELLED</p>
+                            <p class="text-2xl font-bold">${cancelled}</p>
+                        </div>
+                        <div class="bg-blue-500 text-white p-3 rounded text-center">
+                            <p class="text-xs font-bold">TOTAL</p>
+                            <p class="text-2xl font-bold">${filteredData.length}</p>
+                        </div>
+                        <div class="bg-green-500 text-white p-3 rounded text-center">
+                            <p class="text-xs font-bold">FILTERED</p>
+                            <p class="text-2xl font-bold">${filteredData.length}</p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="bg-white p-4 rounded shadow" style="height: 250px;">
+                            <canvas id="chart1" height="60"></canvas>
+                            <p class="text-xs text-center font-bold mt-2">Items by Status</p>
+                        </div>
+                        <div class="bg-white p-4 rounded shadow" style="height: 250px;">
+                            <canvas id="chart2" height="60"></canvas>
+                            <p class="text-xs text-center font-bold mt-2">Items by Category</p>
+                        </div>
+                        <div class="bg-white p-4 rounded shadow" style="height: 250px;">
+                            <canvas id="chart3" height="60"></canvas>
+                            <p class="text-xs text-center font-bold mt-2">Timeline</p>
+                        </div>
+                        <div class="bg-white p-4 rounded shadow" style="height: 250px;">
+                            <canvas id="chart4" height="60"></canvas>
+                            <p class="text-xs text-center font-bold mt-2">By Project</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function render() {
+            const allStatuses = [...new Set(rawData.map(r => r['Status'] || '').filter(Boolean))].sort();
+            const owningProjects = [...new Set(rawData.map(r => getOwningProject(r)).filter(Boolean))].sort();
+
+            document.getElementById('app').innerHTML = `
+                <div class="min-h-screen bg-canvas">
+                    <div class="color-midnight p-6 sticky top-0 z-40 shadow-lg">
+                        <div class="flex justify-between items-center mb-4">
+                            <div>
+                                <h1 class="text-3xl font-bold">📊 RAID Dashboard</h1>
+                                <p class="text-gray-300 text-sm" id="fileName">No file loaded</p>
+                            </div>
+                            <label class="color-gold text-black hover:opacity-90 px-4 py-2 rounded font-bold cursor-pointer">
+                                📤 Upload
+                                <input type="file" accept=".xlsx,.xls" onchange="handleUpload(event)" class="hidden" />
+                            </label>
+                        </div>
+                        <div>
+                            <button onclick="switchTab('dashboard')" class="tab-btn ${currentTab === 'dashboard' ? 'active' : ''}">📈 Dashboard</button>
+                            <button onclick="switchTab('detailed')" class="tab-btn ${currentTab === 'detailed' ? 'active' : ''}">📋 Detailed Items</button>
+                        </div>
+                    </div>
+
+                    <div class="p-6">
+                        ${currentTab === 'dashboard' ? `
+                            ${rawData.length > 0 ? `
+                                <div class="bg-white p-4 rounded shadow mb-4">
+                                    <p class="text-sm font-bold mb-3">🔍 Filters</p>
+                                    <div class="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="text-xs font-bold">Owning Project (Multiple)</label>
+                                            <select id="filterOwningProject" onchange="applyFilters()" multiple class="w-full p-2 border rounded text-sm h-24">
+                                                ${owningProjects.map(p => `<option value="${p}">${p}</option>`).join('')}
+                                            </select>
+                                            <p class="text-xs text-gray-500 mt-1">Ctrl+Click para múltiples</p>
+                                        </div>
+                                        <div>
+                                            <label class="text-xs font-bold">Status (Multiple)</label>
+                                            <div class="border rounded p-2 bg-white h-24 overflow-y-auto">
+                                                ${allStatuses.map(s => `
+                                                    <div style="display: flex; align-items: center; gap: 8px; padding: 4px 0;">
+                                                        <input type="checkbox" id="status_${s}" ${selectedStatuses.includes(s) ? 'checked' : ''} onchange="toggleStatus('${s}')" />
+                                                        <label for="status_${s}" style="font-size: 12px; cursor: pointer;">${s}</label>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                            <p class="text-xs text-gray-500 mt-1">Seleccionados: ${selectedStatuses.length}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            ` : ''}
+                            ${renderDashboardView()}
+                        ` : `
+                            ${renderDetailedView()}
+                        `}
+                    </div>
+                </div>
+            `;
+
+            if (currentTab === 'dashboard' && rawData.length > 0) {
+                setTimeout(drawCharts, 100);
+            } else if (currentTab === 'detailed' && rawData.length > 0) {
+                filterDetailedItems();
+            }
+        }
+
+        function drawCharts() {
+            const active = filteredData.filter(d => ['New', 'Assigned', 'In Progress', 'Monitor'].includes(String(d['Status'] || '').trim()));
+            
+            const statusGroups = {};
+            active.forEach(item => {
+                const status = String(item['Status'] || 'Unknown').trim();
+                if (!statusGroups[status]) statusGroups[status] = 0;
+                statusGroups[status]++;
+            });
+
+            const categoryGroups = {};
+            active.forEach(item => {
+                const cat = getColumnA(item);
+                if (!categoryGroups[cat]) categoryGroups[cat] = 0;
+                categoryGroups[cat]++;
+            });
+
+            // Chart 1: Status
+            if (document.getElementById('chart1')) {
+                if (chartInstances.chart1) chartInstances.chart1.destroy();
+                chartInstances.chart1 = new Chart(document.getElementById('chart1'), {
+                    type: 'doughnut',
+                    data: {
+                        labels: Object.keys(statusGroups),
+                        datasets: [{
+                            data: Object.values(statusGroups),
+                            backgroundColor: Object.keys(statusGroups).map(s => getStatusColor(s))
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {legend: {position: 'bottom', labels: {font: {size: 9}}}}
+                    }
+                });
+            }
+
+            // Chart 2: Category
+            if (document.getElementById('chart2')) {
+                if (chartInstances.chart2) chartInstances.chart2.destroy();
+                chartInstances.chart2 = new Chart(document.getElementById('chart2'), {
+                    type: 'bar',
+                    data: {
+                        labels: Object.keys(categoryGroups),
+                        datasets: [{
+                            label: 'Count',
+                            data: Object.values(categoryGroups),
+                            backgroundColor: Object.keys(categoryGroups).map(c => getCategoryColor(c))
+                        }]
+                    },
+                    options: {
+                        indexAxis: 'y',
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {legend: {display: false}},
+                        scales: {x: {beginAtZero: true}}
+                    }
+                });
+            }
+
+            // Chart 3: Timeline
+            if (document.getElementById('chart3')) {
+                const timeline = {};
+                const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                
+                months.forEach(month => {
+                    timeline[month] = { Risk: 0, Issue: 0, Decision: 0, Action: 0 };
+                });
+
+                active.forEach(item => {
+                    const dueDate = parseDate(item['Due Date']);
+                    if (dueDate) {
+                        const monthName = months[dueDate.getMonth()];
+                        const category = getColumnA(item);
+                        if (timeline[monthName] && timeline[monthName].hasOwnProperty(category)) {
+                            timeline[monthName][category]++;
+                        }
+                    }
+                });
+
+                if (chartInstances.chart3) chartInstances.chart3.destroy();
+                chartInstances.chart3 = new Chart(document.getElementById('chart3'), {
+                    type: 'bar',
+                    data: {
+                        labels: months,
+                        datasets: [
+                            {label: 'Risk', data: months.map(m => timeline[m]['Risk'] || 0), backgroundColor: '#D14600'},
+                            {label: 'Issue', data: months.map(m => timeline[m]['Issue'] || 0), backgroundColor: '#FF7E51'},
+                            {label: 'Decision', data: months.map(m => timeline[m]['Decision'] || 0), backgroundColor: '#4995FF'},
+                            {label: 'Action', data: months.map(m => timeline[m]['Action'] || 0), backgroundColor: '#A1E6FF'}
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {legend: {position: 'top', labels: {font: {size: 8}}}},
+                        scales: {y: {stacked: false, beginAtZero: true}}
+                    }
+                });
+            }
+
+            // Chart 4: By Project
+            if (document.getElementById('chart4')) {
+                const projectGroups = {};
+                active.forEach(item => {
+                    const proj = getOwningProject(item);
+                    if (!projectGroups[proj]) projectGroups[proj] = 0;
+                    projectGroups[proj]++;
+                });
+
+                if (chartInstances.chart4) chartInstances.chart4.destroy();
+                chartInstances.chart4 = new Chart(document.getElementById('chart4'), {
+                    type: 'bar',
+                    data: {
+                        labels: Object.keys(projectGroups),
+                        datasets: [{
+                            label: 'Count',
+                            data: Object.values(projectGroups),
+                            backgroundColor: '#4995FF'
+                        }]
+                    },
+                    options: {
+                        indexAxis: 'y',
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {legend: {display: false}},
+                        scales: {x: {beginAtZero: true}}
+                    }
+                });
+            }
+        }
+
+        render();
+    </script>
+</body>
+</html>
